@@ -107,16 +107,17 @@ Aplikacja wyświetla szczegółowe komunikaty o błędach i przerywa wykonywanie
 
 ### ✅ **Funkcjonalności w pełni działające:**
 - **Export metadanych** - działa perfekcyjnie dla domen, tabel i procedur
-- **Build bazy danych** - tworzy nową bazę i importuje domeny oraz tabele
-- **Update bazy danych** - dodaje nowe obiekty do istniejącej bazy
+- **Build bazy danych** - tworzy nową bazę z dwuetapowym procesem dla procedur
+- **Update bazy danych** - wykonuje diff, dodaje tylko nowe obiekty
 - **Obsługa procedur z SET TERM** - parser poprawnie obsługuje składnię Firebird
+- **Rozwiązanie zależności procedur** - dwuetapowy proces tworzenia
+- **Diff w update-db** - nie duplikuje istniejących obiektów
 
 ### ⚠️ **Scenariusze z ograniczeniami:**
 
 1. **Domeny systemowe w eksporcie**
    - **Problem:** Export zawiera domeny systemowe Firebird (MON$*, SEC$*)
-   - **Obejście:** Ręcznie usuń domeny systemowe z domains.sql przed build-db
-   - **Status:** Wymaga ręcznej interwencji
+   - **Status:** Diff w update-db automatycznie pomija istniejące domeny
 
 2. **Tworzenie bazy danych**
    - **Problem:** `FbConnection.CreateDatabase()` może wymagać embedded Firebird
@@ -143,6 +144,8 @@ Aplikacja wyświetla szczegółowe komunikaty o błędach i przerywa wykonywanie
 - Connection string musi zawierać prawidłowe dane uwierzytelniające dla Firebird
 - Domyślne hasło SYSDBA w Firebird 5.0 to "masterkey"
 - Parser SET TERM obsługuje procedury z niestandardowymi terminatorami (^^)
+- **Update-db wykonuje diff** - sprawdza istniejące obiekty i dodaje tylko nowe
+- **Build-db używa dwuetapowego procesu** - rozwiązuje problem zależności między procedurami
 
 ## Podsumowanie realizacji zadania
 

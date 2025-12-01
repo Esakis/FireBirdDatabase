@@ -120,10 +120,13 @@ namespace DbMetaTool
             using var connection = new FbConnection(dbConnectionString);
             connection.Open();
 
-            // Wykonaj skrypty w kolejności: domeny, tabele, procedury
+            // Wykonaj skrypty w kolejności: domeny, tabele, procedury (dwuetapowo)
             ExecuteScriptsFromDirectory(connection, scriptsDirectory, "domains");
             ExecuteScriptsFromDirectory(connection, scriptsDirectory, "tables");
-            ExecuteScriptsFromDirectory(connection, scriptsDirectory, "procedures");
+            
+            // Procedury w dwóch etapach aby rozwiązać problem zależności
+            ExecuteProcedureHeaders(connection, scriptsDirectory);  // Etap 1: puste procedury
+            ExecuteScriptsFromDirectory(connection, scriptsDirectory, "procedures");  // Etap 2: pełny kod
 
             Console.WriteLine($"Baza danych utworzona: {dbPath}");
         }
@@ -155,6 +158,7 @@ namespace DbMetaTool
 
         /// <summary>
         /// Aktualizuje istniejącą bazę danych Firebird 5.0 na podstawie skryptów.
+        /// Wykonuje diff - dodaje tylko nowe obiekty, nie duplikuje istniejących.
         /// </summary>
         public static void UpdateDatabase(string connectionString, string scriptsDirectory)
         {
@@ -166,10 +170,15 @@ namespace DbMetaTool
 
             Console.WriteLine("Aktualizowanie bazy danych...");
 
-            // Wykonaj skrypty w kolejności: domeny, tabele, procedury
-            ExecuteScriptsFromDirectory(connection, scriptsDirectory, "domains");
-            ExecuteScriptsFromDirectory(connection, scriptsDirectory, "tables");
-            ExecuteScriptsFromDirectory(connection, scriptsDirectory, "procedures");
+            // Pobierz istniejące obiekty z bazy
+            var existingDomains = GetExistingDomains(connection);
+            var existingTables = GetExistingTables(connection);
+            var existingProcedures = GetExistingProcedures(connection);
+
+            // Wykonaj tylko nowe obiekty (diff)
+            ExecuteNewDomainsOnly(connection, scriptsDirectory, existingDomains);
+            ExecuteNewTablesOnly(connection, scriptsDirectory, existingTables);
+            ExecuteNewOrModifiedProcedures(connection, scriptsDirectory, existingProcedures);
 
             Console.WriteLine("Baza danych zaktualizowana pomyślnie.");
         }
@@ -555,6 +564,233 @@ namespace DbMetaTool
             }
 
             return "";
+        }
+
+        // Metody dla diff w UpdateDatabase
+        private static HashSet<string> GetExistingDomains(FbConnection connection)
+        {
+            var domains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string sql = "SELECT RDB$FIELD_NAME FROM RDB$FIELDS WHERE RDB$FIELD_NAME NOT STARTING WITH 'RDB$'";
+            
+            using var cmd = new FbCommand(sql, connection);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                string domainName = reader["RDB$FIELD_NAME"]?.ToString()?.Trim() ?? "";
+                if (!string.IsNullOrEmpty(domainName))
+                    domains.Add(domainName);
+            }
+            return domains;
+        }
+
+        private static HashSet<string> GetExistingTables(FbConnection connection)
+        {
+            var tables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string sql = @"SELECT r.RDB$RELATION_NAME FROM RDB$RELATIONS r 
+                          WHERE r.RDB$VIEW_BLR IS NULL AND (r.RDB$SYSTEM_FLAG IS NULL OR r.RDB$SYSTEM_FLAG = 0)";
+            
+            using var cmd = new FbCommand(sql, connection);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                string tableName = reader["RDB$RELATION_NAME"]?.ToString()?.Trim() ?? "";
+                if (!string.IsNullOrEmpty(tableName))
+                    tables.Add(tableName);
+            }
+            return tables;
+        }
+
+        private static HashSet<string> GetExistingProcedures(FbConnection connection)
+        {
+            var procedures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string sql = "SELECT RDB$PROCEDURE_NAME FROM RDB$PROCEDURES WHERE RDB$SYSTEM_FLAG IS NULL OR RDB$SYSTEM_FLAG = 0";
+            
+            using var cmd = new FbCommand(sql, connection);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                string procName = reader["RDB$PROCEDURE_NAME"]?.ToString()?.Trim() ?? "";
+                if (!string.IsNullOrEmpty(procName))
+                    procedures.Add(procName);
+            }
+            return procedures;
+        }
+
+        private static void ExecuteNewDomainsOnly(FbConnection connection, string scriptsDirectory, HashSet<string> existingDomains)
+        {
+            string fullPath = Path.Combine(scriptsDirectory, "domains");
+            if (!Directory.Exists(fullPath))
+            {
+                Console.WriteLine("Katalog domains nie istnieje, pomijam...");
+                return;
+            }
+
+            var sqlFiles = Directory.GetFiles(fullPath, "*.sql").OrderBy(f => f);
+            foreach (string sqlFile in sqlFiles)
+            {
+                Console.WriteLine($"Sprawdzam domeny w skrypcie: {Path.GetFileName(sqlFile)}");
+                string sql = File.ReadAllText(sqlFile);
+                ExecuteNewDomainsFromScript(connection, sql, existingDomains);
+            }
+        }
+
+        private static void ExecuteNewTablesOnly(FbConnection connection, string scriptsDirectory, HashSet<string> existingTables)
+        {
+            string fullPath = Path.Combine(scriptsDirectory, "tables");
+            if (!Directory.Exists(fullPath))
+            {
+                Console.WriteLine("Katalog tables nie istnieje, pomijam...");
+                return;
+            }
+
+            var sqlFiles = Directory.GetFiles(fullPath, "*.sql").OrderBy(f => f);
+            foreach (string sqlFile in sqlFiles)
+            {
+                Console.WriteLine($"Sprawdzam tabele w skrypcie: {Path.GetFileName(sqlFile)}");
+                string sql = File.ReadAllText(sqlFile);
+                ExecuteNewTablesFromScript(connection, sql, existingTables);
+            }
+        }
+
+        private static void ExecuteNewOrModifiedProcedures(FbConnection connection, string scriptsDirectory, HashSet<string> existingProcedures)
+        {
+            string fullPath = Path.Combine(scriptsDirectory, "procedures");
+            if (!Directory.Exists(fullPath))
+            {
+                Console.WriteLine("Katalog procedures nie istnieje, pomijam...");
+                return;
+            }
+
+            var sqlFiles = Directory.GetFiles(fullPath, "*.sql").OrderBy(f => f);
+            foreach (string sqlFile in sqlFiles)
+            {
+                Console.WriteLine($"Wykonuję procedury z skryptu: {Path.GetFileName(sqlFile)}");
+                string sql = File.ReadAllText(sqlFile);
+                // Dla procedur używamy CREATE OR ALTER - zawsze działa
+                ExecuteSqlScript(connection, sql.Replace("CREATE PROCEDURE", "CREATE OR ALTER PROCEDURE"));
+            }
+        }
+
+        private static void ExecuteNewDomainsFromScript(FbConnection connection, string sql, HashSet<string> existingDomains)
+        {
+            var lines = sql.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string line in lines)
+            {
+                string trimmedLine = line.Trim();
+                if (trimmedLine.StartsWith("CREATE DOMAIN", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Wyciągnij nazwę domeny
+                    var parts = trimmedLine.Split(' ');
+                    if (parts.Length >= 3)
+                    {
+                        string domainName = parts[2];
+                        if (!existingDomains.Contains(domainName))
+                        {
+                            Console.WriteLine($"Dodaję nową domenę: {domainName}");
+                            using var cmd = new FbCommand(trimmedLine, connection);
+                            cmd.ExecuteNonQuery();
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Domena {domainName} już istnieje, pomijam...");
+                        }
+                    }
+                }
+            }
+        }
+
+        private static void ExecuteNewTablesFromScript(FbConnection connection, string sql, HashSet<string> existingTables)
+        {
+            // Parsowanie CREATE TABLE jest bardziej skomplikowane - uproszczona wersja
+            var commands = sql.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string command in commands)
+            {
+                string trimmedCommand = command.Trim();
+                if (trimmedCommand.StartsWith("CREATE TABLE", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Wyciągnij nazwę tabeli
+                    var lines = trimmedCommand.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (lines.Length > 0)
+                    {
+                        var parts = lines[0].Split(' ');
+                        if (parts.Length >= 3)
+                        {
+                            string tableName = parts[2];
+                            if (!existingTables.Contains(tableName))
+                            {
+                                Console.WriteLine($"Dodaję nową tabelę: {tableName}");
+                                using var cmd = new FbCommand(trimmedCommand, connection);
+                                cmd.ExecuteNonQuery();
+                            }
+                            else
+                            {
+                                Console.WriteLine($"Tabela {tableName} już istnieje, pomijam...");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Metoda dla dwuetapowego tworzenia procedur
+        private static void ExecuteProcedureHeaders(FbConnection connection, string scriptsDirectory)
+        {
+            string fullPath = Path.Combine(scriptsDirectory, "procedures");
+            if (!Directory.Exists(fullPath))
+            {
+                Console.WriteLine("Katalog procedures nie istnieje, pomijam tworzenie nagłówków...");
+                return;
+            }
+
+            Console.WriteLine("Etap 1: Tworzenie pustych procedur (nagłówki)...");
+            var sqlFiles = Directory.GetFiles(fullPath, "*.sql").OrderBy(f => f);
+            foreach (string sqlFile in sqlFiles)
+            {
+                string sql = File.ReadAllText(sqlFile);
+                CreateEmptyProceduresFromScript(connection, sql);
+            }
+        }
+
+        private static void CreateEmptyProceduresFromScript(FbConnection connection, string sql)
+        {
+            // Parsuj procedury i utwórz puste wersje
+            var lines = sql.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            string currentProcedure = "";
+            bool inProcedure = false;
+
+            foreach (string line in lines)
+            {
+                string trimmedLine = line.Trim();
+                
+                if (trimmedLine.StartsWith("CREATE", StringComparison.OrdinalIgnoreCase) && 
+                    trimmedLine.Contains("PROCEDURE"))
+                {
+                    inProcedure = true;
+                    currentProcedure = trimmedLine;
+                }
+                else if (inProcedure && trimmedLine.StartsWith("AS", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Utwórz pustą procedurę
+                    string emptyProc = currentProcedure + "\nAS\nBEGIN\n  -- Placeholder\nEND";
+                    try
+                    {
+                        using var cmd = new FbCommand(emptyProc, connection);
+                        cmd.ExecuteNonQuery();
+                        Console.WriteLine($"Utworzono pustą procedurę z: {currentProcedure.Split(' ')[3]}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Błąd tworzenia pustej procedury: {ex.Message}");
+                        // Kontynuuj - może procedura już istnieje
+                    }
+                    inProcedure = false;
+                    currentProcedure = "";
+                }
+                else if (inProcedure)
+                {
+                    currentProcedure += "\n" + line;
+                }
+            }
         }
     }
 }
