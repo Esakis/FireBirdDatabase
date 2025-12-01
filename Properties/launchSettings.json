@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "DbMetaTool": {
+      "commandName": "Project",
+      "commandLineArgs": "export-scripts --connection-string \"User=SYSDBA;Password=masterkey;Database=C:\\temp\\TESTDB.FDB;DataSource=localhost;\" --output-dir \"C:\\temp\\debug_export\""
+    }
+  }
+}
